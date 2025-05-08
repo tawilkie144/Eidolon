@@ -1,116 +1,93 @@
 const std = @import("std");
 
-// Although this function looks imperative, note that its job is to
-// declaratively construct a build graph that will be executed by an external
-// runner.
-pub fn build(b: *std.Build) void {
-    // Standard target options allows the person running `zig build` to choose
-    // what target to build for. Here we do not override the defaults, which
-    // means any target is allowed, and the default is native. Other options
-    // for restricting supported target set are available.
-    const target = b.standardTargetOptions(.{});
+const modules: [1][]const u8 = .{"core"};
 
-    // Standard optimization options allow the person running `zig build` to select
-    // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
-    // set a preferred release mode, allowing the user to decide how to optimize.
-    const optimize = b.standardOptimizeOption(.{});
+const targets = [_]std.Target.Query{
+    .{
+        .cpu_arch = .x86_64,
+        .os_tag = .linux,
+        .abi = .gnu,
+    },
+    .{
+        .cpu_arch = .x86_64,
+        .os_tag = .windows,
+    },
+};
 
-    // This creates a "module", which represents a collection of source files alongside
-    // some compilation options, such as optimization mode and linked system libraries.
-    // Every executable or library we compile will be based on one or more modules.
-    const lib_mod = b.createModule(.{
-        // `root_source_file` is the Zig "entry point" of the module. If a module
-        // only contains e.g. external object files, you can make this `null`.
-        // In this case the main source file is merely a path, however, in more
-        // complicated build scripts, this could be a generated file.
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+pub fn build(b: *std.Build) !void {
+    const optimize_opts = b.standardOptimizeOption(.{});
+    const target_windows = b.option(bool, "windows", "Build for Windows") orelse false;
+    const target: std.Target.Query = if (target_windows)
+        targets[1]
+    else
+        targets[0];
 
-    // We will also create a module for our other entry point, 'main.zig'.
-    const exe_mod = b.createModule(.{
-        // `root_source_file` is the Zig "entry point" of the module. If a module
-        // only contains e.g. external object files, you can make this `null`.
-        // In this case the main source file is merely a path, however, in more
-        // complicated build scripts, this could be a generated file.
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const include_realtime_tests = b.option(bool, "realtimeTests", "Include realtime tests") orelse false;
 
-    // Modules can depend on one another using the `std.Build.Module.addImport` function.
-    // This is what allows Zig source code to use `@import("foo")` where 'foo' is not a
-    // file path. In this case, we set up `exe_mod` to import `lib_mod`.
-    exe_mod.addImport("Eidolon_lib", lib_mod);
-
-    // Now, we will create a static library based on the module we created above.
-    // This creates a `std.Build.Step.Compile`, which is the build step responsible
-    // for actually invoking the compiler.
-    const lib = b.addLibrary(.{
-        .linkage = .static,
-        .name = "Eidolon",
-        .root_module = lib_mod,
-    });
-
-    // This declares intent for the library to be installed into the standard
-    // location when the user invokes the "install" step (the default step when
-    // running `zig build`).
-    b.installArtifact(lib);
-
-    // This creates another `std.Build.Step.Compile`, but this one builds an executable
-    // rather than a static library.
     const exe = b.addExecutable(.{
         .name = "Eidolon",
-        .root_module = exe_mod,
+        .root_source_file = b.path("src/main.zig"),
+        .target = b.resolveTargetQuery(target),
+        .optimize = optimize_opts,
+    });
+    const target_output = b.addInstallArtifact(exe, .{
+        .dest_dir = .{
+            .override = .{
+                .custom = try target.zigTriple(b.allocator),
+            },
+        },
     });
 
-    // This declares intent for the executable to be installed into the
-    // standard location when the user invokes the "install" step (the default
-    // step when running `zig build`).
-    b.installArtifact(exe);
+    b.getInstallStep().dependOn(&target_output.step);
 
-    // This *creates* a Run step in the build graph, to be executed when another
-    // step is evaluated that depends on it. The next line below will establish
-    // such a dependency.
-    const run_cmd = b.addRunArtifact(exe);
+    const run_test_step = b.step("test", "Run unit tests");
+    {
+        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+        defer _ = gpa.deinit();
+        const allocator = gpa.allocator();
 
-    // By making the run step depend on the install step, it will be run from the
-    // installation directory rather than directly from within the cache directory.
-    // This is not necessary, however, if the application depends on other installed
-    // files, this ensures they will be present and in the expected location.
-    run_cmd.step.dependOn(b.getInstallStep());
+        const root_path = try std.fs.realpathAlloc(allocator, ".");
+        defer allocator.free(root_path);
 
-    // This allows the user to pass arguments to the application in the build
-    // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
+        for (modules) |module_name| {
+            const mod_name = try std.fmt.allocPrint(allocator, "Eidolon_{s}", .{module_name});
+            defer allocator.free(mod_name);
+            const mod_file = try std.fmt.allocPrint(allocator, "src/{s}/{s}.zig", .{ module_name, module_name });
+            defer allocator.free(mod_file);
+            const mod = b.addModule(mod_name, .{
+                .root_source_file = b.path(mod_file),
+            });
+            exe.root_module.addImport(mod_name, mod);
+
+            const tests_dir_name = try std.fmt.allocPrint(allocator, "./src/tests/{s}", .{module_name});
+            defer allocator.free(tests_dir_name);
+            const tests_path = try std.fs.realpathAlloc(allocator, tests_dir_name);
+            defer allocator.free(tests_path);
+            var tests_dir = try std.fs.openDirAbsolute(tests_path, .{ .iterate = true });
+            defer tests_dir.close();
+
+            var walker = try tests_dir.walk(allocator);
+            defer walker.deinit();
+            while (try walker.next()) |entry| {
+                if (entry.kind == .directory) continue;
+                if (!std.mem.endsWith(u8, entry.basename, "_tests.zig")) continue;
+                if (!include_realtime_tests and std.mem.endsWith(u8, entry.basename, "_realtime_tests.zig")) continue;
+                var paths = [_][]const u8{ tests_path, entry.path };
+                const test_file_path = try std.fs.path.join(allocator, &paths);
+                defer allocator.free(test_file_path);
+                const test_file_relative_path = try std.fs.path.relative(allocator, root_path, test_file_path);
+                defer allocator.free(test_file_relative_path);
+                const mod_test = b.addTest(.{
+                    .root_source_file = b.path(test_file_relative_path),
+                });
+                mod_test.root_module.addImport(mod_name, mod);
+                const run_test = b.addRunArtifact(mod_test);
+                run_test_step.dependOn(&run_test.step);
+            }
+        }
     }
 
-    // This creates a build step. It will be visible in the `zig build --help` menu,
-    // and can be selected like this: `zig build run`
-    // This will evaluate the `run` step rather than the default, which is "install".
-    const run_step = b.step("run", "Run the app");
-    run_step.dependOn(&run_cmd.step);
-
-    // Creates a step for unit testing. This only builds the test executable
-    // but does not run it.
-    const lib_unit_tests = b.addTest(.{
-        .root_module = lib_mod,
-    });
-
-    const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
-
-    const exe_unit_tests = b.addTest(.{
-        .root_module = exe_mod,
-    });
-
-    const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
-
-    // Similar to creating the run step earlier, this exposes a `test` step to
-    // the `zig build --help` menu, providing a way for the user to request
-    // running the unit tests.
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_lib_unit_tests.step);
-    test_step.dependOn(&run_exe_unit_tests.step);
+    const run_exe = b.addRunArtifact(exe);
+    const run_step = b.step("run", "Run the application");
+    run_step.dependOn(&run_exe.step);
 }
