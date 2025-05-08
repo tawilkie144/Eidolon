@@ -1,45 +1,49 @@
-//! By convention, main.zig is where your main function lives in the case that
-//! you are building an executable. If you are making a library, the convention
-//! is to delete this file and start with root.zig instead.
+const std = @import("std");
+const core = @import("Eidolon_core");
+
+const events = core.events;
+const session = core.session;
+const EidolonLogging = core.logger;
+const LogScope = EidolonLogging.LogScope;
+const EidolonClock = core.Clock;
+
+fn threadFn(loop: *events.EventLoop) void {
+    loop.start();
+}
 
 pub fn main() !void {
-    // Prints to stderr (it's a shortcut based on `std.io.getStdErr()`)
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    var event_loop = events.EventLoop.init(allocator);
+    defer event_loop.deinit();
 
-    // stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    const stdout_file = std.io.getStdOut().writer();
-    var bw = std.io.bufferedWriter(stdout_file);
-    const stdout = bw.writer();
+    const loop_thread = try std.Thread.spawn(.{}, threadFn, .{event_loop});
 
-    try stdout.print("Run `zig build test` to run the tests.\n", .{});
+    const session_id: session.Identifier = 1;
 
-    try bw.flush(); // Don't forget to flush!
+    // Add events with different durations to test ordering
+    try event_loop.addEvent(session_id, events.ViewerEventType.start, false, 10); // Longer duration (later event)
+    try event_loop.addEvent(session_id, events.ViewerEventType.stop, false, 5); // Shorter duration (earlier event)
+
+    // The event with shorter duration should be at the top of the queue
+    std.debug.print("Event Count: {} (expecting 2)", .{event_loop.count()}); //try testing.expect(event_loop.count() == 2);
+    const peek_event = event_loop.event_queue.peek().?;
+    std.debug.print("Top event Type: {} (expecting stop)", .{peek_event.event_type}); //try testing.expect(peek_event.event_type == ViewerEventType.stop);
+
+    // Now add an event with the same end time as the earliest one
+    try event_loop.addEvent(session_id, events.ViewerEventType.next, false, 5);
+    std.debug.print("", .{}); //try testing.expect(event_loop.count() == 3);
+
+    std.Thread.sleep(5.2 * std.time.ns_per_s);
+    std.debug.print("", .{}); //try std.testing.expect(event_loop.count() == 1);
+    std.Thread.sleep(5 * std.time.ns_per_s);
+    std.debug.print("", .{}); //try std.testing.expect(event_loop.count() == 0);
+
+    // Stop the event loop
+    event_loop.stop();
+
+    // Wait for the thread to complete
+    loop_thread.join();
+    try std.testing.expect(!event_loop.is_running);
 }
-
-test "simple test" {
-    var list = std.ArrayList(i32).init(std.testing.allocator);
-    defer list.deinit(); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
-
-test "use other module" {
-    try std.testing.expectEqual(@as(i32, 150), lib.add(100, 50));
-}
-
-test "fuzz example" {
-    const global = struct {
-        fn testOne(input: []const u8) anyerror!void {
-            // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-            try std.testing.expect(!std.mem.eql(u8, "canyoufindme", input));
-        }
-    };
-    try std.testing.fuzz(global.testOne, .{});
-}
-
-const std = @import("std");
-
-/// This imports the separate module containing `root.zig`. Take a look in `build.zig` for details.
-const lib = @import("Eidolon_lib");
